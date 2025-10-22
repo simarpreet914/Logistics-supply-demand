@@ -31,6 +31,15 @@ def load_logistics_data(csv_path):
         df['Restaurant Latitude'] = pd.to_numeric(df['Restaurant Latitude'], errors='coerce')
         df['Restaurant Longitude'] = pd.to_numeric(df['Restaurant Longitude'], errors='coerce')
         df = df.dropna(subset=['Restaurant Latitude', 'Restaurant Longitude'])
+        df['h3_index_id'] = df.apply(
+            lambda row: h3.latlng_to_cell(
+                row['Restaurant Latitude'], 
+                row['Restaurant Longitude'],
+                res=8
+            ),
+            axis=1
+        )
+        df.to_csv("data_with_h3.csv", index=False)
         
         print(f"✅ Loaded {len(df)} valid logistics records")
         return df
@@ -44,7 +53,7 @@ def create_h3_hexagons(df, resolution=8):
         'total_orders': 0,
         'success_orders': 0,
         'fail_orders': 0,
-        'coords': []
+        'coords': set()
     })
     
     for _, row in df.iterrows():
@@ -56,10 +65,10 @@ def create_h3_hexagons(df, resolution=8):
                 continue
             
             # Get H3 index for this coordinate
-            hex_id = h3.latlng_to_cell(lat, lng, resolution)
+            hex_id = row['h3_index_id']
             
             hexagon_data[hex_id]['total_orders'] += 1
-            hexagon_data[hex_id]['coords'].append((lat, lng))
+            hexagon_data[hex_id]['coords'].add((lat, lng))
             
             order_status = str(row['Order Status']).strip().lower()
             if order_status == 'success':
@@ -97,7 +106,8 @@ def create_h3_hexagons(df, resolution=8):
                     'fail_orders': data['fail_orders'],
                     'success_rate': round(success_rate, 2),
                     'center_lat': round(center[0], 6),
-                    'center_lng': round(center[1], 6)
+                    'center_lng': round(center[1], 6),
+                    'unique_restaurants': len(data['coords'])
                 }
             })
     
@@ -127,6 +137,9 @@ def create_map_with_h3_and_pincodes(logistics_csv, pincode_geojson_path, resolut
     df = load_logistics_data(logistics_csv)
     if df is None:
         return None
+    
+     # ✅ Calculate total unique restaurants efficiently
+    total_unique_restaurants = df[['Restaurant Latitude', 'Restaurant Longitude']].drop_duplicates().shape[0]
     
     # Create H3 hexagons
     print(f"🔷 Creating H3 hexagons at resolution {resolution}...")
@@ -189,18 +202,18 @@ def create_map_with_h3_and_pincodes(logistics_csv, pincode_geojson_path, resolut
         style_function=lambda feature: {
             'fillColor': get_color_from_success_rate(feature['properties']['success_rate']),
             'color': '#333333',
-            'weight': 1,
+            'weight': 0.3,
             'fillOpacity': 0.6,
             'opacity': 0.8
         },
         highlight_function=lambda x: {
-            'weight': 3,
+            'weight': 0.5,
             'color': '#000000',
             'fillOpacity': 0.8
         },
         tooltip=folium.GeoJsonTooltip(
-            fields=['h3_index', 'total_orders', 'success_orders', 'fail_orders', 'success_rate'],
-            aliases=['H3 Index:', 'Total Orders:', 'Success:', 'Failed:', 'Success Rate:'],
+            fields=['h3_index', 'total_orders', 'success_orders', 'fail_orders', 'success_rate', 'unique_restaurants'],
+            aliases=['H3 Index:', 'Total Orders:', 'Success:', 'Failed:', 'Success Rate:', 'Restaurants/Providers:'],
             style="background-color: white; color: #333333; font-family: arial; font-size: 12px; padding: 10px;"
         ),
         show=True
@@ -246,6 +259,7 @@ def create_map_with_h3_and_pincodes(logistics_csv, pincode_geojson_path, resolut
             🚚 Logistics Heatmap Legend
         </p>
         <p style="margin: 5px 0;"><strong>Total Orders:</strong> {total_orders:,}</p>
+        <p style="margin: 5px 0;"><strong>Total Restaurants:</strong> {total_unique_restaurants:,}</p>
         <p style="margin: 5px 0;"><strong>Overall Success Rate:</strong> {success_rate:.1f}%</p>
         <p style="margin: 5px 0;"><strong>Active Hexagons:</strong> {len(h3_geojson['features']):,}</p>
         <hr style="margin: 10px 0;">
