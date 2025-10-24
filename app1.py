@@ -25,10 +25,8 @@ def load_logistics_data(csv_path):
         df['Hour'] = df['Timestamp'].dt.hour
         df['Date'] = df['Timestamp'].dt.date
         
-        df['Time_Bin'] = pd.cut(df['Hour'], 
-                               bins=[0, 6, 12, 18, 24],
-                               labels=['Night (12AM-6AM)', 'Morning (6AM-12PM)', 
-                                      'Afternoon (12PM-6PM)', 'Evening (6PM-12AM)'])
+        # Create hour bins (00-01, 01-02, etc.)
+        df['Hour_Bin'] = df['Hour'].apply(lambda x: f"{x:02d}-{(x+1):02d}")
         
         df['Restaurant Latitude'] = pd.to_numeric(df['Restaurant Latitude'], errors='coerce')
         df['Restaurant Longitude'] = pd.to_numeric(df['Restaurant Longitude'], errors='coerce')
@@ -57,7 +55,8 @@ def create_h3_hexagons(df):
         'success_orders': 0,
         'fail_orders': 0,
         'coords': set(),
-        'time_bins': set()
+        'hour_bins': set(),
+        'logistics_players': set()
     })
     
     for _, row in df.iterrows():
@@ -72,7 +71,8 @@ def create_h3_hexagons(df):
             
             hexagon_data[hex_id]['total_orders'] += 1
             hexagon_data[hex_id]['coords'].add((lat, lng))
-            hexagon_data[hex_id]['time_bins'].add(str(row['Time_Bin']))
+            hexagon_data[hex_id]['hour_bins'].add(str(row['Hour_Bin']))
+            hexagon_data[hex_id]['logistics_players'].add(str(row['Logistics Player']))
             
             order_status = str(row['Order Status']).strip().lower()
             if order_status == 'success':
@@ -107,7 +107,8 @@ def create_h3_hexagons(df):
                     'center_lat': round(center[0], 6),
                     'center_lng': round(center[1], 6),
                     'unique_restaurants': len(data['coords']),
-                    'time_bins': ','.join(data['time_bins'])
+                    'hour_bins': ','.join(sorted(data['hour_bins'])),
+                    'logistics_players': ','.join(data['logistics_players'])
                 }
             })
     
@@ -126,6 +127,19 @@ def index():
     success_rate = (success_orders / total_orders * 100) if total_orders > 0 else 0
     total_restaurants = logistics_df[['Restaurant Latitude', 'Restaurant Longitude']].drop_duplicates().shape[0]
     
+    # Get unique logistics players
+    logistics_players = sorted(
+        logistics_df['Logistics Player']
+        .dropna()                           # remove NaN values
+        .astype(str)                        # ensure all are strings
+        .loc[lambda x: (x.str.strip() != '') & (x.str.lower() != 'unknown')]  # remove empty or 'unknown'
+        .unique()
+        .tolist()
+    )
+    
+    # Get unique hour bins
+    hour_bins = sorted(logistics_df['Hour_Bin'].unique().tolist())
+    
     # Initial hexagons (all data)
     initial_hexagons = create_h3_hexagons(logistics_df)
     
@@ -141,172 +155,211 @@ def index():
         <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
         <script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
         <style>
-            body { margin: 0; padding: 0; font-family: Arial, sans-serif; }
-            #map { position: absolute; top: 0; bottom: 0; width: 100%; }
+            * { box-sizing: border-box; }
+            body { margin: 0; padding: 0; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+            #map { position: absolute; top: 45px; bottom: 0; width: 100%; }
             
-            .filter-panel {
+            /* Top Filter Bar */
+            .top-filter-bar {
                 position: fixed;
-                top: 80px;
-                right: 20px;
-                width: 320px;
-                background-color: white;
-                border: 2px solid #3498db;
-                z-index: 9999;
-                font-size: 13px;
-                padding: 15px;
-                border-radius: 8px;
-                box-shadow: 0 0 15px rgba(0,0,0,0.2);
-                max-height: 80vh;
-                overflow-y: auto;
+                top: 0;
+                left: 0;
+                right: 0;
+                height: 45px; /* thinner */
+                background: #f7f7f7; /* light gray-white */
+                border-bottom: 1px solid #ddd; /* subtle separator */
+                box-shadow: none; /* remove heavy shadow */
+                z-index: 10000;
+                display: flex;
+                align-items: center;
+                padding: 0 15px;
+                gap: 15px;
             }
+
             
-            .filter-title {
-                margin: 0 0 15px 0;
-                color: #3498db;
-                font-size: 16px;
-            }
-            
-            .filter-section {
-                margin-bottom: 15px;
+            .filter-group {
+                display: flex;
+                align-items: center;
+                gap: 8px;
             }
             
             .filter-label {
-                font-weight: bold;
-                display: block;
-                margin-bottom: 5px;
+                color: #333;
+                font-weight: 500;
             }
             
-            .time-bin-checkbox {
-                display: block;
-                margin: 5px 0;
+            .filter-select {
+                padding: 8px 12px;
+                border: none;
+                border-radius: 6px;
+                font-size: 14px;
+                background: white;
                 cursor: pointer;
+                min-width: 150px;
+                box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+                transition: all 0.3s;
+            }
+            
+            .filter-select:hover {
+                box-shadow: 0 4px 8px rgba(0,0,0,0.2);
+            }
+            
+            .filter-select:focus {
+                outline: 2px solid #ffd700;
+            }
+            
+            .gps-input {
+                padding: 8px 12px;
+                border: none;
+                border-radius: 6px;
+                font-size: 14px;
+                width: 200px;
+                box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            }
+            
+            .gps-input::placeholder {
+                color: #999;
             }
             
             .apply-btn {
-                width: 100%;
-                padding: 10px;
-                background-color: #3498db;
-                color: white;
-                border: none;
+                padding: 6px 16px;
+                background: #e0e0e0;
+                color: #333;
+                border: 1px solid #ccc;
                 border-radius: 4px;
+                font-weight: 500;
+                font-size: 13px;
                 cursor: pointer;
-                font-weight: bold;
-                font-size: 14px;
+                transition: all 0.2s ease;
             }
             
             .apply-btn:hover {
-                background-color: #2980b9;
+                background: #d5d5d5;
             }
             
             .apply-btn:disabled {
-                background-color: #95a5a6;
+                background: #f0f0f0;
+                color: #888;
                 cursor: not-allowed;
-            }
-            
-            .filter-status {
-                margin-top: 10px;
-                padding: 8px;
-                background-color: #ecf0f1;
-                border-radius: 4px;
-                font-size: 11px;
-                display: none;
-            }
-            
-            .legend {
-                position: fixed;
-                bottom: 50px;
-                left: 50px;
-                width: 280px;
-                background-color: white;
-                border: 2px solid grey;
-                z-index: 9999;
-                font-size: 14px;
-                padding: 15px;
-                border-radius: 5px;
-                box-shadow: 0 0 15px rgba(0,0,0,0.2);
-            }
-            
-            .title-banner {
-                position: fixed;
-                top: 10px;
-                left: 50%;
-                transform: translateX(-50%);
-                width: 500px;
-                background-color: white;
-                border: 2px solid #3498db;
-                z-index: 9999;
-                font-size: 16px;
-                padding: 15px;
-                border-radius: 8px;
-                box-shadow: 0 0 15px rgba(0,0,0,0.2);
-                text-align: center;
             }
             
             .loading {
                 display: inline-block;
                 width: 12px;
                 height: 12px;
-                border: 2px solid #3498db;
+                border: 2px solid #333;
                 border-top-color: transparent;
                 border-radius: 50%;
                 animation: spin 0.6s linear infinite;
+                margin-right: 5px;
             }
             
             @keyframes spin {
                 to { transform: rotate(360deg); }
             }
             
-            /* Ensure Leaflet controls are visible */
+            /* Legend */
+            .legend {
+                position: fixed;
+                bottom: 10px;
+                left: 10px;
+                width: 150px;
+                background-color: white;
+                border: none;
+                z-index: 9999;
+                font-size: 11px;
+                padding: 5px;
+                border-radius: 5px;
+                box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            }
+            
+            .legend-title {
+                font-weight: bold;
+                font-size: 12px;
+                margin-bottom: 5px;
+            }
+            
+            .legend p {
+                margin: 5px 0;
+            }
+            
+            /* Leaflet controls adjustment */
             .leaflet-control-layers,
             .leaflet-control-zoom {
                 z-index: 1000 !important;
+                margin-top: 10px !important;
+            }
+            
+            /* Status message */
+            .status-message {
+                position: fixed;
+                top: 70px;
+                right: 20px;
+                background: white;
+                padding: 12px 20px;
+                border-radius: 8px;
+                box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+                z-index: 9999;
+                display: none;
+                font-size: 13px;
+                max-width: 300px;
+            }
+            
+            .status-message.success {
+                border-left: 4px solid #10b981;
+            }
+            
+            .status-message.error {
+                border-left: 4px solid #ef4444;
             }
         </style>
     </head>
     <body>
-        <div id="map"></div>
-        
-        <div class="title-banner">
-            <h3 style="margin: 0; color: #3498db;">🗺️ Logistics Supply-Demand Visualization</h3>
-            <p style="margin: 5px 0; font-size: 12px; color: #666;">
-                H3 Hexagons • Real-Time Filtering • Success Rate Heatmap
-            </p>
-        </div>
-        
-        <div class="filter-panel">
-            <h3 class="filter-title">🔍 Time Period Filter</h3>
-            
-            <div class="filter-section">
-                <label class="filter-label">Select Time Periods:</label>
-                <label class="time-bin-checkbox">
-                    <input type="checkbox" value="Night (12AM-6AM)" checked> Night (12AM-6AM)
-                </label>
-                <label class="time-bin-checkbox">
-                    <input type="checkbox" value="Morning (6AM-12PM)" checked> Morning (6AM-12PM)
-                </label>
-                <label class="time-bin-checkbox">
-                    <input type="checkbox" value="Afternoon (12PM-6PM)" checked> Afternoon (12PM-6PM)
-                </label>
-                <label class="time-bin-checkbox">
-                    <input type="checkbox" value="Evening (6PM-12AM)" checked> Evening (6PM-12AM)
-                </label>
+        <!-- Top Filter Bar -->
+        <div class="top-filter-bar">
+            <div class="filter-group">
+                <label class="filter-label">Filter by Logistics Player:</label>
+                <select id="logistics-player-filter" class="filter-select">
+                    <option value="All">All</option>
+                    {% for player in logistics_players %}
+                    <option value="{{ player }}">{{ player.split('/')[-1] }}</option>
+                    {% endfor %}
+                </select>
             </div>
             
-            <button id="apply-filter" class="apply-btn">Apply Filter</button>
+            <div class="filter-group">
+                <label class="filter-label">Filter by Hour Bin:</label>
+                <select id="hour-bin-filter" class="filter-select">
+                    <option value="All">All</option>
+                    {% for bin in hour_bins %}
+                    <option value="{{ bin }}">{{ bin }}</option>
+                    {% endfor %}
+                </select>
+            </div>
             
-            <div id="filter-status" class="filter-status"></div>
+            <div class="filter-group">
+                <label class="filter-label">Enter your GPS:</label>
+                <input type="text" id="gps-input" class="gps-input" placeholder="Lat, Lon">
+            </div>
+            
+            <button id="apply-filter" class="apply-btn">Apply Filters</button>
         </div>
         
+        <!-- Status Message -->
+        <div id="status-message" class="status-message"></div>
+        
+        <!-- Map -->
+        <div id="map"></div>
+        
+        <!-- Legend -->
         <div class="legend">
-            <p style="margin: 0; font-weight: bold; font-size: 16px; margin-bottom: 10px;">
-                🚚 Logistics Heatmap Legend
-            </p>
-            <p style="margin: 5px 0;"><strong>Total Orders:</strong> {{ total_orders }}</p>
-            <p style="margin: 5px 0;"><strong>Total Restaurants:</strong> {{ total_restaurants }}</p>
-            <p style="margin: 5px 0;"><strong>Overall Success Rate:</strong> {{ success_rate }}%</p>
-            <p style="margin: 5px 0;"><strong>Active Hexagons:</strong> <span id="hexagon-count">{{ hexagon_count }}</span></p>
-            <hr style="margin: 10px 0;">
-            <p style="margin: 5px 0; font-weight: bold;">Success Rate Colors:</p>
+            <p class="legend-title">🚚 Logistics Heatmap</p>
+            <p><strong>Total Orders:</strong> {{ total_orders }}</p>
+            <p><strong>Total Restaurants:</strong> {{ total_restaurants }}</p>
+            <p><strong>Success Rate:</strong> {{ success_rate }}%</p>
+            <p><strong>Active Hexagons:</strong> <span id="hexagon-count">{{ hexagon_count }}</span></p>
+            <hr style="margin: 10px 0; border: none; border-top: 1px solid #e5e7eb;">
+            <p style="font-weight: bold; margin-bottom: 5px;">Success Rate Colors:</p>
             <p style="margin: 3px 0;"><span style="color: #1a9850;">█</span> 80-100% (Excellent)</p>
             <p style="margin: 3px 0;"><span style="color: #91cf60;">█</span> 60-80% (Good)</p>
             <p style="margin: 3px 0;"><span style="color: #fee090;">█</span> 40-60% (Fair)</p>
@@ -316,7 +369,7 @@ def index():
         
         <script>
             // Initialize map
-            var map = L.map('map').setView([20.5937, 78.9629], 5);
+            var map = L.map('map').setView([28.5355, 77.2200], 12);
             
             // Add base layer
             L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png', {
@@ -325,12 +378,13 @@ def index():
                 maxZoom: 20
             }).addTo(map);
             
-            // Create layer groups for proper z-index control
+            // Create layer groups
             var pincodeLayer = null;
             var hexagonLayer = null;
             var markerClusterGroup = null;
+            var gpsMarker = null;
             
-            // Add pincode boundaries FIRST (bottom layer)
+            // Add pincode boundaries
             var pincodeData = {{ pincode_data | tojson }};
             if (pincodeData && pincodeData.features && pincodeData.features.length > 0) {
                 pincodeLayer = L.geoJSON(pincodeData, {
@@ -346,13 +400,11 @@ def index():
                             layer.bindTooltip(
                                 '<b>Pincode:</b> ' + feature.properties.Pincode + '<br>' +
                                 '<b>Office:</b> ' + (feature.properties.Office_Name || 'N/A'),
-                                {
-                                    style: "background-color: white; color: #333333; font-family: arial; font-size: 11px; padding: 8px;"
-                                }
+                                { className: 'custom-tooltip' }
                             );
                         }
                     },
-                    pane: 'tilePane' // Put pincode boundaries below everything
+                    pane: 'tilePane'
                 }).addTo(map);
             }
             
@@ -360,7 +412,7 @@ def index():
             var initialData = {{ initial_hexagons | tojson }};
             renderHexagons(initialData);
             
-            // Add supply points (restaurant locations) with MarkerCluster
+            // Add supply points with MarkerCluster
             var supplyPoints = {{ supply_points | tojson }};
             markerClusterGroup = L.markerClusterGroup({
                 maxClusterRadius: 20,
@@ -376,7 +428,7 @@ def index():
                     fillColor: '#2ecc71',
                     fillOpacity: 0.7,
                     weight: 1,
-                    pane: 'markerPane' // Ensure markers are on top
+                    pane: 'markerPane'
                 });
                 marker.bindPopup('Restaurant: ' + point[0].toFixed(6) + ', ' + point[1].toFixed(6));
                 markerClusterGroup.addLayer(marker);
@@ -386,41 +438,69 @@ def index():
             
             // Layer control
             var baseMaps = {};
-            var overlayMaps = {
-                "H3 Hexagons (Success Rate)": hexagonLayer,
-                "Supply Points (Restaurants)": markerClusterGroup
-            };
+            var overlayMaps = {};
+            var layerControl = null;
             
-            if (pincodeLayer) {
-                overlayMaps["Pincode Boundaries"] = pincodeLayer;
+            function initLayerControl() {
+                if (layerControl) {
+                    map.removeControl(layerControl);
+                }
+                
+                overlayMaps = {
+                    "H3 Hexagons (Success Rate)": hexagonLayer,
+                    "Supply Points (Restaurants)": markerClusterGroup
+                };
+                
+                if (pincodeLayer) {
+                    overlayMaps["Pincode Boundaries"] = pincodeLayer;
+                }
+                
+                layerControl = L.control.layers(baseMaps, overlayMaps, {
+                    collapsed: false,
+                    position: 'topright'
+                });
+                
+                layerControl.addTo(map);
             }
             
-            L.control.layers(baseMaps, overlayMaps, {
-                collapsed: false,
-                position: 'topright'
-            }).addTo(map);
+            initLayerControl();
             
             // Filter functionality
             document.getElementById('apply-filter').addEventListener('click', applyFilter);
             
             function applyFilter() {
                 var btn = document.getElementById('apply-filter');
-                var statusDiv = document.getElementById('filter-status');
+                var statusDiv = document.getElementById('status-message');
                 
-                // Get selected time bins
-                var checkboxes = document.querySelectorAll('.time-bin-checkbox input[type="checkbox"]:checked');
-                var selectedTimeBins = Array.from(checkboxes).map(cb => cb.value);
+                var logisticsPlayer = document.getElementById('logistics-player-filter').value;
+                var hourBin = document.getElementById('hour-bin-filter').value;
+                var gpsInput = document.getElementById('gps-input').value.trim();
                 
-                if (selectedTimeBins.length === 0) {
-                    statusDiv.style.display = 'block';
-                    statusDiv.innerHTML = '⚠️ Please select at least one time period';
-                    statusDiv.style.backgroundColor = '#ffe6e6';
-                    return;
+                // Handle GPS input
+                if (gpsInput) {
+                    var coords = gpsInput.split(',').map(c => parseFloat(c.trim()));
+                    if (coords.length === 2 && !isNaN(coords[0]) && !isNaN(coords[1])) {
+                        if (gpsMarker) {
+                            map.removeLayer(gpsMarker);
+                        }
+                        gpsMarker = L.marker(coords, {
+                            icon: L.icon({
+                                iconUrl: 'https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-2x-red.png',
+                                shadowUrl: 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/0.7.7/images/marker-shadow.png',
+                                iconSize: [25, 41],
+                                iconAnchor: [12, 41],
+                                popupAnchor: [1, -34],
+                                shadowSize: [41, 41]
+                            })
+                        }).addTo(map);
+                        gpsMarker.bindPopup('Your Location: ' + coords[0].toFixed(6) + ', ' + coords[1].toFixed(6)).openPopup();
+                        map.setView(coords, 14);
+                    }
                 }
                 
                 // Disable button and show loading
                 btn.disabled = true;
-                btn.innerHTML = '<span class="loading"></span> Filtering...';
+                btn.innerHTML = '<span class="loading"></span>Filtering...';
                 
                 // Make API call
                 fetch('/filter_hexagons', {
@@ -429,48 +509,54 @@ def index():
                         'Content-Type': 'application/json',
                     },
                     body: JSON.stringify({
-                        time_bins: selectedTimeBins
+                        logistics_player: logisticsPlayer,
+                        hour_bin: hourBin
                     })
                 })
                 .then(response => response.json())
                 .then(data => {
                     renderHexagons(data.hexagons);
                     
-                    // Update status
+                    // Show status
+                    statusDiv.className = 'status-message success';
                     statusDiv.style.display = 'block';
-                    statusDiv.style.backgroundColor = '#d4edda';
                     statusDiv.innerHTML = '✅ Showing ' + data.hexagons.features.length + ' hexagons<br>' +
-                                        'Total Orders: ' + data.stats.total_orders + '<br>' +
-                                        'Success Rate: ' + data.stats.success_rate + '%';
+                                        'Orders: ' + data.stats.total_orders + ' | Success Rate: ' + data.stats.success_rate + '%';
+                    
+                    setTimeout(() => {
+                        statusDiv.style.display = 'none';
+                    }, 3000);
                     
                     // Update hexagon count
                     document.getElementById('hexagon-count').textContent = data.hexagons.features.length;
                     
-                    // Update layer control
-                    updateLayerControl();
+                    // Reinitialize layer control
+                    initLayerControl();
                     
                     // Re-enable button
                     btn.disabled = false;
-                    btn.innerHTML = 'Apply Filter';
+                    btn.innerHTML = 'Apply Filters';
                 })
                 .catch(error => {
                     console.error('Error:', error);
+                    statusDiv.className = 'status-message error';
                     statusDiv.style.display = 'block';
-                    statusDiv.style.backgroundColor = '#ffe6e6';
-                    statusDiv.innerHTML = '❌ Error applying filter';
+                    statusDiv.innerHTML = '❌ Error applying filters';
+                    
+                    setTimeout(() => {
+                        statusDiv.style.display = 'none';
+                    }, 3000);
                     
                     btn.disabled = false;
-                    btn.innerHTML = 'Apply Filter';
+                    btn.innerHTML = 'Apply Filters';
                 });
             }
             
             function renderHexagons(geojson) {
-                // Remove existing hexagon layer
                 if (hexagonLayer) {
                     map.removeLayer(hexagonLayer);
                 }
                 
-                // Add new hexagon layer on overlayPane (above pincode boundaries)
                 hexagonLayer = L.geoJSON(geojson, {
                     style: function(feature) {
                         return {
@@ -490,18 +576,11 @@ def index():
                             '<b>Failed:</b> ' + props.fail_orders + '<br>' +
                             '<b>Success Rate:</b> ' + props.success_rate + '%<br>' +
                             '<b>Restaurants:</b> ' + props.unique_restaurants,
-                            {
-                                style: "background-color: white; color: #333333; font-family: arial; font-size: 12px; padding: 10px;"
-                            }
+                            { className: 'custom-tooltip' }
                         );
                     },
-                    pane: 'overlayPane' // Put hexagons above pincode boundaries
+                    pane: 'overlayPane'
                 }).addTo(map);
-            }
-            
-            function updateLayerControl() {
-                // Update the layer control reference
-                overlayMaps["H3 Hexagons (Success Rate)"] = hexagonLayer;
             }
             
             function getColor(success_rate) {
@@ -524,21 +603,29 @@ def index():
         success_rate=f"{success_rate:.1f}",
         hexagon_count=f"{len(initial_hexagons['features']):,}",
         pincode_data=pincode_geojson if pincode_geojson else {},
-        supply_points=supply_points
+        supply_points=supply_points,
+        logistics_players=logistics_players,
+        hour_bins=hour_bins
     )
 
 @app.route('/filter_hexagons', methods=['POST'])
 def filter_hexagons():
-    """API endpoint to filter hexagons by time bins"""
+    """API endpoint to filter hexagons by hour bin and logistics player"""
     try:
         data = request.get_json()
-        selected_time_bins = data.get('time_bins', [])
+        logistics_player = data.get('logistics_player', 'All')
+        hour_bin = data.get('hour_bin', 'All')
         
-        if not selected_time_bins:
-            return jsonify({'error': 'No time bins selected'}), 400
+        # Start with full dataframe
+        filtered_df = logistics_df.copy()
         
-        # Filter dataframe by time bins
-        filtered_df = logistics_df[logistics_df['Time_Bin'].isin(selected_time_bins)]
+        # Apply logistics player filter
+        if logistics_player != 'All':
+            filtered_df = filtered_df[filtered_df['Logistics Player'] == logistics_player]
+        
+        # Apply hour bin filter
+        if hour_bin != 'All':
+            filtered_df = filtered_df[filtered_df['Hour_Bin'] == hour_bin]
         
         # Create hexagons from filtered data
         hexagons = create_h3_hexagons(filtered_df)
@@ -561,7 +648,7 @@ def filter_hexagons():
 
 if __name__ == '__main__':
     print("=" * 70)
-    print("🚀 Starting Flask Server for Dynamic Logistics Visualization")
+    print("🚀 Starting Flask Server for Logistics Visualization")
     print("=" * 70)
     
     # Load data
@@ -572,7 +659,7 @@ if __name__ == '__main__':
         print("❌ Failed to load logistics data. Exiting.")
         exit(1)
     
-    # Extract supply points (restaurant locations)
+    # Extract supply points
     print("📍 Extracting supply points...")
     supply_points = logistics_df[['Restaurant Latitude', 'Restaurant Longitude']].drop_duplicates().values.tolist()
     print(f"   Found {len(supply_points)} unique supply points")
@@ -592,16 +679,15 @@ if __name__ == '__main__':
     
     print("\n" + "=" * 70)
     print("✅ Server ready!")
-    print("🌐 Open your browser and go to: http://127.0.0.1:5000")
+    print("🌐 Open: http://127.0.0.1:5000")
     print("=" * 70)
     print("\n🔥 Features:")
-    print("   ✓ Real-time time bin filtering (no page reload)")
-    print("   ✓ Dynamic hexagon updates via API")
-    print("   ✓ Supply points with marker clustering")
-    print("   ✓ Proper layer ordering (Pincode → Hexagons → Markers)")
-    print("   ✓ Layer control panel")
-    print("   ✓ Live statistics updates")
-    print("\n💡 Press Ctrl+C to stop the server")
+    print("   ✓ Hour bin filtering (00-01, 01-02, etc.)")
+    print("   ✓ Logistics player filtering")
+    print("   ✓ GPS location marker")
+    print("   ✓ Real-time hexagon updates")
+    print("   ✓ Layer control with hide/unhide")
+    print("\n💡 Press Ctrl+C to stop")
     print("=" * 70 + "\n")
     
     app.run(debug=True, host='0.0.0.0', port=5000)
