@@ -1,0 +1,11 @@
+# Ignore python cache and virtual environment
+__pycache__/
+venv/
+*.pyc
+
+# Ignore git directory
+.git/
+
+# Ignore large data files
+*.csv
+*.geojson
