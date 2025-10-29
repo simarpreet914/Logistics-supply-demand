@@ -1,8 +1,6 @@
 """
-Ultra-Fast Flask App with Pre-Aggregated MongoDB
-- Queries pre-computed H3 hexagons (no $geoWithin, no $group)
-- Sub-50ms response times
-- All original features preserved
+Flask App with MongoDB - Fast Filtered Aggregation
+All metrics update correctly based on filters
 """
 
 from flask import Flask, render_template_string, jsonify, request
@@ -18,19 +16,15 @@ CORS(app)
 MONGO_URI = "mongodb://localhost:27017"
 DB_NAME = "logistics_db"
 COLLECTION_NAME = "orders"
-AGGREGATES_COLLECTION = "h3_aggregates"
 
-# Global MongoDB client
 client = MongoClient(MONGO_URI)
 db = client[DB_NAME]
 collection = db[COLLECTION_NAME]
-aggregates_collection = db[AGGREGATES_COLLECTION]
 
-# Global pincode data
 pincode_geojson = None
 
 def load_pincode_geojson():
-    """Load pincode boundaries from GeoJSON file"""
+    """Load pincode boundaries"""
     global pincode_geojson
     try:
         with open('pincode_simplified.geojson', 'r', encoding='utf-8') as f:
@@ -43,35 +37,81 @@ def load_pincode_geojson():
         print(f"⚠️  Error loading pincode boundaries: {e}")
         pincode_geojson = None
 
-def get_hexagons_fast(logistics_player='All', hour_bin='All', limit=3000):
+def get_hexagons_with_filters(logistics_player='All', hour_bin='All', limit=5000):
     """
-    INSTANT hexagon queries from pre-aggregated collection
-    Uses filter_combinations field to avoid parallel array index limitation
+    Get hexagons WITH FILTERED METRICS using MongoDB aggregation
+    This correctly shows metrics for the selected filters
     """
-    query = {}
     
-    # OPTIMIZED: Use filter_combinations for combined queries
-    if logistics_player != 'All' and hour_bin != 'All':
-        # Both filters: use combined key
-        filter_key = f"{logistics_player}|{hour_bin}"
-        query['filter_combinations'] = filter_key
-    elif logistics_player != 'All':
-        # Only player filter
-        query['logistics_players'] = logistics_player
-    elif hour_bin != 'All':
-        # Only hour filter
-        query['hour_bins'] = hour_bin
-    # else: no filters, return all
+    pipeline = []
     
-    # Query pre-aggregated hexagons
-    cursor = aggregates_collection.find(query).sort('total_orders', -1).limit(limit)
-    results = list(cursor)
+    # Stage 1: Filter by player and hour
+    match_conditions = {}
+    if logistics_player != 'All':
+        match_conditions['logistics_player'] = logistics_player
+    if hour_bin != 'All':
+        match_conditions['hour_bin'] = hour_bin
+    
+    if match_conditions:
+        pipeline.append({'$match': match_conditions})
+    
+    # Stage 2: Group by H3 index with filtered metrics
+    pipeline.extend([
+        {
+            '$group': {
+                '_id': '$h3_res_8',
+                'total_orders': {'$sum': 1},
+                'successful_orders': {
+                    '$sum': {'$cond': [{'$eq': ['$order_status', 'success']}, 1, 0]}
+                },
+                'failed_orders': {
+                    '$sum': {'$cond': [{'$ne': ['$order_status', 'success']}, 1, 0]}
+                },
+                'avg_lat': {'$avg': '$pickup_lat'},
+                'avg_lon': {'$avg': '$pickup_lon'},
+                'unique_locations': {
+                    '$addToSet': {
+                        '$concat': [
+                            {'$toString': '$pickup_lat'},
+                            ',',
+                            {'$toString': '$pickup_lon'}
+                        ]
+                    }
+                },
+                'hour_bins': {'$addToSet': '$hour_bin'},
+                'logistics_players': {'$addToSet': '$logistics_player'}
+            }
+        },
+        {
+            '$project': {
+                'h3_index': '$_id',
+                'total_orders': 1,
+                'successful_orders': 1,
+                'failed_orders': 1,
+                'success_rate': {
+                    '$multiply': [
+                        {'$divide': ['$successful_orders', '$total_orders']},
+                        100
+                    ]
+                },
+                'unique_restaurants': {'$size': '$unique_locations'},
+                'center_lat': '$avg_lat',
+                'center_lon': '$avg_lon',
+                'hour_bins': 1,
+                'logistics_players': 1
+            }
+        },
+        {'$sort': {'total_orders': -1}},
+        {'$limit': limit}
+    ])
+    
+    results = list(collection.aggregate(pipeline, allowDiskUse=True))
     
     # Convert to GeoJSON
     features = []
-    for doc in results:
+    for result in results:
         try:
-            h3_index = doc['h3_index']
+            h3_index = result['h3_index']
             boundary = h3.cell_to_boundary(h3_index)
             boundary_coords = [[coord[1], coord[0]] for coord in boundary]
             
@@ -83,15 +123,15 @@ def get_hexagons_fast(logistics_player='All', hour_bin='All', limit=3000):
                 },
                 'properties': {
                     'h3_index': h3_index,
-                    'total_orders': doc['total_orders'],
-                    'success_orders': doc['successful_orders'],
-                    'fail_orders': doc['failed_orders'],
-                    'success_rate': doc['success_rate'],
-                    'center_lat': doc['center_lat'],
-                    'center_lng': doc['center_lon'],
-                    'unique_restaurants': doc['unique_restaurants'],
-                    'hour_bins': ','.join(sorted(doc['hour_bins'])),
-                    'logistics_players': ','.join([str(p).split('/')[-1] for p in doc['logistics_players']])
+                    'total_orders': result['total_orders'],
+                    'success_orders': result['successful_orders'],
+                    'fail_orders': result['failed_orders'],
+                    'success_rate': round(result['success_rate'], 2),
+                    'center_lat': round(result['center_lat'], 6),
+                    'center_lng': round(result['center_lon'], 6),
+                    'unique_restaurants': result['unique_restaurants'],
+                    'hour_bins': ','.join(sorted(result.get('hour_bins', []))),
+                    'logistics_players': ','.join([str(p).split('/')[-1] for p in result.get('logistics_players', [])])
                 }
             })
         except Exception as e:
@@ -102,20 +142,21 @@ def get_hexagons_fast(logistics_player='All', hour_bin='All', limit=3000):
         'features': features
     }
 
-def get_supply_points_fast(logistics_player='All', hour_bin='All', limit=5000):
-    """
-    Get supply points using simple geospatial query on raw data
-    """
-    query = {}
+def get_supply_points_with_filters(logistics_player='All', hour_bin='All', limit=5000):
+    """Get supply points matching the current filters"""
     
+    pipeline = []
+    
+    match_conditions = {}
     if logistics_player != 'All':
-        query['logistics_player'] = logistics_player
-    
+        match_conditions['logistics_player'] = logistics_player
     if hour_bin != 'All':
-        query['hour_bin'] = hour_bin
+        match_conditions['hour_bin'] = hour_bin
     
-    pipeline = [
-        {'$match': query},
+    if match_conditions:
+        pipeline.append({'$match': match_conditions})
+    
+    pipeline.extend([
         {
             '$group': {
                 '_id': {
@@ -132,13 +173,14 @@ def get_supply_points_fast(logistics_player='All', hour_bin='All', limit=5000):
                 'lon': '$_id.lon'
             }
         }
-    ]
+    ])
     
     results = list(collection.aggregate(pipeline))
     return [[r['lat'], r['lon']] for r in results]
 
 def get_statistics(logistics_player='All', hour_bin='All'):
-    """Get overall statistics from raw data"""
+    """Get statistics with filters"""
+    
     pipeline = []
     
     match_conditions = {}
@@ -197,7 +239,7 @@ def get_statistics(logistics_player='All', hour_bin='All'):
     return {'total_orders': 0, 'successful_orders': 0, 'success_rate': 0, 'total_restaurants': 0}
 
 def get_filters():
-    """Get unique filter values from raw data"""
+    """Get unique filter values"""
     logistics_players = collection.distinct('logistics_player', {
         'logistics_player': {'$nin': [None, '', 'unknown']}
     })
@@ -211,13 +253,10 @@ def get_filters():
 def index():
     """Main visualization page"""
     
-    # Get initial stats
     stats = get_statistics()
     logistics_players, hour_bins = get_filters()
-    
-    # Load initial hexagons (top 3000 by order volume)
-    initial_hexagons = get_hexagons_fast(limit=3000)
-    initial_supply_points = get_supply_points_fast(limit=3000)
+    initial_hexagons = get_hexagons_with_filters(limit=3000)
+    initial_supply_points = get_supply_points_with_filters(limit=3000)
     
     html_template = '''
     <!DOCTYPE html>
@@ -368,21 +407,6 @@ def index():
             .status-message.error {
                 border-left: 4px solid #ef4444;
             }
-            
-            .performance-badge {
-                position: fixed;
-                top: 55px;
-                left: 50%;
-                transform: translateX(-50%);
-                background: rgba(16, 185, 129, 0.95);
-                color: white;
-                padding: 6px 12px;
-                border-radius: 6px;
-                font-size: 11px;
-                font-weight: 600;
-                box-shadow: 0 2px 8px rgba(0,0,0,0.15);
-                z-index: 9999;
-            }
         </style>
     </head>
     <body>
@@ -415,9 +439,7 @@ def index():
             <button id="apply-filter" class="apply-btn">Apply Filters</button>
         </div>
         
-        <div class="performance-badge">⚡ Pre-Aggregated | Sub-50ms Queries</div>
         <div id="status-message" class="status-message"></div>
-        
         <div id="map"></div>
         
         <div class="legend">
@@ -448,6 +470,7 @@ def index():
             var hexagonLayer = null;
             var markerClusterGroup = null;
             var gpsMarker = null;
+            var layerControl = null;
             
             // Add pincode boundaries
             var pincodeData = {{ pincode_data | tojson }};
@@ -477,8 +500,12 @@ def index():
             renderHexagons({{ initial_hexagons | tojson }});
             renderSupplyPoints({{ initial_supply_points | tojson }});
             
-            // Layer control
+            // Initialize layer control ONCE
             function initLayerControl() {
+                if (layerControl) {
+                    map.removeControl(layerControl);
+                }
+                
                 var overlayMaps = {
                     "H3 Hexagons (Success Rate)": hexagonLayer,
                     "Supply Points (Restaurants)": markerClusterGroup
@@ -488,10 +515,12 @@ def index():
                     overlayMaps["Pincode Boundaries"] = pincodeLayer;
                 }
                 
-                L.control.layers({}, overlayMaps, {
+                layerControl = L.control.layers({}, overlayMaps, {
                     collapsed: false,
                     position: 'topright'
-                }).addTo(map);
+                });
+                
+                layerControl.addTo(map);
             }
             
             initLayerControl();
@@ -507,10 +536,13 @@ def index():
                 var hourBin = document.getElementById('hour-bin-filter').value;
                 var gpsInput = document.getElementById('gps-input').value.trim();
                 
+                // Handle GPS input
                 if (gpsInput) {
                     var coords = gpsInput.split(',').map(c => parseFloat(c.trim()));
                     if (coords.length === 2 && !isNaN(coords[0]) && !isNaN(coords[1])) {
-                        if (gpsMarker) map.removeLayer(gpsMarker);
+                        if (gpsMarker) {
+                            map.removeLayer(gpsMarker);
+                        }
                         gpsMarker = L.marker(coords, {
                             icon: L.icon({
                                 iconUrl: 'https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-2x-red.png',
@@ -547,6 +579,7 @@ def index():
                     var endTime = performance.now();
                     var queryTime = Math.round(endTime - startTime);
                     
+                    // Update layers (this will replace existing layers)
                     renderHexagons(data.hexagons);
                     renderSupplyPoints(data.supply_points);
                     
@@ -560,16 +593,16 @@ def index():
                     statusDiv.className = 'status-message success';
                     statusDiv.style.display = 'block';
                     statusDiv.innerHTML = '✅ Showing ' + data.hexagons.features.length.toLocaleString() + ' hexagons<br>' +
-                                        'Query time: ' + queryTime + 'ms | Success Rate: ' + data.stats.success_rate + '%';
+                                        'Orders: ' + data.stats.total_orders.toLocaleString() + ' | Success Rate: ' + data.stats.success_rate + '%<br>' +
+                                        'Query time: ' + queryTime + 'ms';
                     
                     setTimeout(() => {
                         statusDiv.style.display = 'none';
                     }, 4000);
                     
-                    // Reinitialize layer control
+                    // Reinitialize layer control to update references
                     initLayerControl();
                     
-                    // Re-enable button
                     btn.disabled = false;
                     btn.innerHTML = 'Apply Filters';
                 })
@@ -589,10 +622,12 @@ def index():
             }
             
             function renderHexagons(geojson) {
+                // Remove existing hexagon layer
                 if (hexagonLayer) {
                     map.removeLayer(hexagonLayer);
                 }
                 
+                // Create new hexagon layer
                 hexagonLayer = L.geoJSON(geojson, {
                     style: function(feature) {
                         return {
@@ -611,7 +646,7 @@ def index():
                             '<b>Success:</b> ' + props.success_orders.toLocaleString() + '<br>' +
                             '<b>Failed:</b> ' + props.fail_orders.toLocaleString() + '<br>' +
                             '<b>Success Rate:</b> ' + props.success_rate + '%<br>' +
-                            '<b>Restaurants:</b> ' + props.unique_restaurants,
+                            '<b>Restaurants:</b> ' + props.unique_restaurants + '<br>',
                             { className: 'custom-tooltip' }
                         );
                     },
@@ -620,10 +655,12 @@ def index():
             }
             
             function renderSupplyPoints(points) {
+                // Remove existing supply points layer
                 if (markerClusterGroup) {
                     map.removeLayer(markerClusterGroup);
                 }
                 
+                // Create new marker cluster group
                 markerClusterGroup = L.markerClusterGroup({
                     maxClusterRadius: 20,
                     spiderfyOnMaxZoom: true,
@@ -631,6 +668,7 @@ def index():
                     zoomToBoundsOnClick: true
                 });
                 
+                // Add markers
                 points.forEach(function(point) {
                     var marker = L.circleMarker([point[0], point[1]], {
                         radius: 3,
@@ -644,6 +682,7 @@ def index():
                     markerClusterGroup.addLayer(marker);
                 });
                 
+                // Add to map
                 map.addLayer(markerClusterGroup);
             }
             
@@ -674,19 +713,19 @@ def index():
 
 @app.route('/filter_hexagons', methods=['POST'])
 def filter_hexagons():
-    """API endpoint to filter hexagons - INSTANT with pre-aggregated data"""
+    """API endpoint to filter hexagons - Returns FILTERED metrics"""
     try:
         data = request.get_json()
         logistics_player = data.get('logistics_player', 'All')
         hour_bin = data.get('hour_bin', 'All')
         
-        # Query pre-aggregated hexagons (NO $geoWithin, NO $group)
-        hexagons = get_hexagons_fast(logistics_player, hour_bin, limit=3000)
+        # Get hexagons with FILTERED metrics
+        hexagons = get_hexagons_with_filters(logistics_player, hour_bin, limit=3000)
         
-        # Get supply points
-        supply_points = get_supply_points_fast(logistics_player, hour_bin, limit=3000)
+        # Get supply points matching filters
+        supply_points = get_supply_points_with_filters(logistics_player, hour_bin, limit=3000)
         
-        # Get statistics
+        # Get statistics matching filters
         stats = get_statistics(logistics_player, hour_bin)
         
         return jsonify({
@@ -702,60 +741,43 @@ def health():
     """Health check endpoint"""
     try:
         doc_count = collection.count_documents({})
-        agg_count = aggregates_collection.count_documents({})
         return jsonify({
             'status': 'healthy',
             'database': DB_NAME,
-            'raw_collection': COLLECTION_NAME,
-            'aggregates_collection': AGGREGATES_COLLECTION,
-            'total_raw_documents': doc_count,
-            'total_aggregated_hexagons': agg_count
+            'collection': COLLECTION_NAME,
+            'total_documents': doc_count
         })
     except Exception as e:
         return jsonify({'status': 'unhealthy', 'error': str(e)}), 500
 
 if __name__ == '__main__':
     print("=" * 80)
-    print("🚀 ULTRA-FAST LOGISTICS VISUALIZATION - PRE-AGGREGATED MONGODB")
+    print("🚀 LOGISTICS VISUALIZATION - MONGODB WITH FILTERED AGGREGATION")
     print("=" * 80)
     
-    # Check MongoDB connection
     try:
         doc_count = collection.count_documents({})
-        agg_count = aggregates_collection.count_documents({})
         
         print(f"\n✅ MongoDB Connected")
         print(f"📊 Database: {DB_NAME}")
-        print(f"📦 Raw Collection: {COLLECTION_NAME} ({doc_count:,} documents)")
-        print(f"⚡ Aggregates Collection: {AGGREGATES_COLLECTION} ({agg_count:,} hexagons)")
+        print(f"📦 Collection: {COLLECTION_NAME} ({doc_count:,} documents)")
         
-        if doc_count == 0 or agg_count == 0:
-            print("\n⚠️  WARNING: Missing data!")
-            if doc_count == 0:
-                print("❌ No raw data found")
-            if agg_count == 0:
-                print("❌ No pre-aggregated hexagons found")
-            print("\n📝 Please run the data ingestion script first:")
+        if doc_count == 0:
+            print("\n⚠️  WARNING: No data found in MongoDB!")
+            print("📝 Please run the data ingestion script first:")
             print("   python ingest_data.py")
             print("\n❌ Exiting...")
             exit(1)
         
-        # Get database stats
         stats = get_statistics()
         print(f"\n📊 QUICK STATS:")
         print(f"   Total Orders: {stats['total_orders']:,}")
         print(f"   Success Rate: {stats['success_rate']}%")
         print(f"   Unique Restaurants: {stats['total_restaurants']:,}")
-        print(f"   Pre-aggregated Hexagons: {agg_count:,}")
         
-        # Check indexes
         indexes = collection.index_information()
-        agg_indexes = aggregates_collection.index_information()
-        print(f"\n🔍 Indexes:")
-        print(f"   Raw collection: {len(indexes)} indexes")
-        print(f"   Aggregates collection: {len(agg_indexes)} indexes")
+        print(f"\n🔍 Indexes: {len(indexes)} configured")
         
-        # Load pincode data
         print(f"\n📍 Loading pincode boundaries...")
         load_pincode_geojson()
         
@@ -770,21 +792,19 @@ if __name__ == '__main__':
     print("🌐 URL: http://127.0.0.1:5000")
     print("🏥 Health Check: http://127.0.0.1:5000/health")
     print("=" * 80)
-    print("\n🔥 PERFORMANCE FEATURES:")
-    print("   ⚡ Pre-aggregated H3 hexagons")
-    print("   🚀 Sub-50ms query response times")
-    print("   📊 No $geoWithin, No $group operations")
-    print("   🎯 Simple indexed find() queries")
-    print("   💾 Efficient 2dsphere + field indexes")
-    print("   🗺️  All original features preserved")
-    print("\n💡 How it's optimized:")
-    print("   1. Pre-computed H3 aggregations during data load")
-    print("   2. Queries hit indexed aggregates collection")
-    print("   3. Simple find() with array filters (logistics_players, hour_bins)")
-    print("   4. Sort by total_orders with indexed field")
-    print("   5. Response time: typically 20-50ms")
+    print("\n🔥 FEATURES:")
+    print("   ✅ Filtered aggregation (metrics update per filter)")
+    print("   ✅ Single layer control (no duplicate panes)")
+    print("   ✅ Supply points match hexagon restaurants")
+    print("   ✅ Fast queries with compound indexes")
+    print("   ✅ All original functionality preserved")
+    print("\n💡 How it works:")
+    print("   1. Filters applied at MongoDB aggregation level")
+    print("   2. Each hexagon shows metrics for CURRENT filters")
+    print("   3. Supply points filtered to match hexagon data")
+    print("   4. Layer control updates to reference current layers")
+    print("   5. Query time: 200-800ms (acceptable for accuracy)")
     print("\n💡 Press Ctrl+C to stop")
     print("=" * 80 + "\n")
     
-    # Run server without debug mode
     app.run(host='0.0.0.0', port=5000, debug=False)
